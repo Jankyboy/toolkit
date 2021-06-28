@@ -9,7 +9,10 @@ import {
   isThrottledStatusCode,
   getExponentialRetryTimeInMilliseconds,
   tryGetRetryAfterValueTimeInMilliseconds,
-  displayHttpDiagnostics
+  displayHttpDiagnostics,
+  getFileSize,
+  rmFile,
+  sleep
 } from './utils'
 import {URL} from 'url'
 import {StatusReporter} from './status-reporter'
@@ -20,6 +23,7 @@ import {HttpManager} from './http-manager'
 import {DownloadItem} from './download-specification'
 import {getDownloadFileConcurrency, getRetryLimit} from './config-variables'
 import {IncomingHttpHeaders} from 'http'
+import {retryHttpClientRequest} from './requestUtils'
 
 export class DownloadHttpClient {
   // http manager is used for concurrent connections when downloading multiple files at once
@@ -44,16 +48,11 @@ export class DownloadHttpClient {
     // use the first client from the httpManager, `keep-alive` is not used so the connection will close immediately
     const client = this.downloadHttpManager.getClient(0)
     const headers = getDownloadHeaders('application/json')
-    const response = await client.get(artifactUrl, headers)
-    const body: string = await response.readBody()
-
-    if (isSuccessStatusCode(response.message.statusCode) && body) {
-      return JSON.parse(body)
-    }
-    displayHttpDiagnostics(response)
-    throw new Error(
-      `Unable to list artifacts for the run. Resource Url ${artifactUrl}`
+    const response = await retryHttpClientRequest('List Artifacts', async () =>
+      client.get(artifactUrl, headers)
     )
+    const body: string = await response.readBody()
+    return JSON.parse(body)
   }
 
   /**
@@ -72,14 +71,12 @@ export class DownloadHttpClient {
     // use the first client from the httpManager, `keep-alive` is not used so the connection will close immediately
     const client = this.downloadHttpManager.getClient(0)
     const headers = getDownloadHeaders('application/json')
-    const response = await client.get(resourceUrl.toString(), headers)
+    const response = await retryHttpClientRequest(
+      'Get Container Items',
+      async () => client.get(resourceUrl.toString(), headers)
+    )
     const body: string = await response.readBody()
-
-    if (isSuccessStatusCode(response.message.statusCode) && body) {
-      return JSON.parse(body)
-    }
-    displayHttpDiagnostics(response)
-    throw new Error(`Unable to get ContainersItems from ${resourceUrl}`)
+    return JSON.parse(body)
   }
 
   /**
@@ -151,7 +148,7 @@ export class DownloadHttpClient {
   ): Promise<void> {
     let retryCount = 0
     const retryLimit = getRetryLimit()
-    const destinationStream = fs.createWriteStream(downloadPath)
+    let destinationStream = fs.createWriteStream(downloadPath)
     const headers = getDownloadHeaders('application/json', true, true)
 
     // a single GET request is used to download a file
@@ -186,14 +183,14 @@ export class DownloadHttpClient {
           core.info(
             `Backoff due to too many requests, retry #${retryCount}. Waiting for ${retryAfterValue} milliseconds before continuing the download`
           )
-          await new Promise(resolve => setTimeout(resolve, retryAfterValue))
+          await sleep(retryAfterValue)
         } else {
           // Back off using an exponential value that depends on the retry count
           const backoffTime = getExponentialRetryTimeInMilliseconds(retryCount)
           core.info(
             `Exponential backoff for retry #${retryCount}. Waiting for ${backoffTime} milliseconds before continuing the download`
           )
-          await new Promise(resolve => setTimeout(resolve, backoffTime))
+          await sleep(backoffTime)
         }
         core.info(
           `Finished backoff for retry #${retryCount}, continuing with download`
@@ -201,11 +198,39 @@ export class DownloadHttpClient {
       }
     }
 
+    const isAllBytesReceived = (
+      expected?: string,
+      received?: number
+    ): boolean => {
+      // be lenient, if any input is missing, assume success, i.e. not truncated
+      if (
+        !expected ||
+        !received ||
+        process.env['ACTIONS_ARTIFACT_SKIP_DOWNLOAD_VALIDATION']
+      ) {
+        core.info('Skipping download validation.')
+        return true
+      }
+
+      return parseInt(expected) === received
+    }
+
+    const resetDestinationStream = async (
+      fileDownloadPath: string
+    ): Promise<void> => {
+      destinationStream.close()
+      await rmFile(fileDownloadPath)
+      destinationStream = fs.createWriteStream(fileDownloadPath)
+    }
+
     // keep trying to download a file until a retry limit has been reached
     while (retryCount <= retryLimit) {
       let response: IHttpClientResponse
       try {
         response = await makeDownloadRequest()
+        if (core.isDebug()) {
+          displayHttpDiagnostics(response)
+        }
       } catch (error) {
         // if an error is caught, it is usually indicative of a timeout so retry the download
         core.info('An error occurred while attempting to download a file')
@@ -217,19 +242,37 @@ export class DownloadHttpClient {
         continue
       }
 
+      let forceRetry = false
       if (isSuccessStatusCode(response.message.statusCode)) {
         // The body contains the contents of the file however calling response.readBody() causes all the content to be converted to a string
         // which can cause some gzip encoded data to be lost
         // Instead of using response.readBody(), response.message is a readableStream that can be directly used to get the raw body contents
-        return this.pipeResponseToFile(
-          response,
-          destinationStream,
-          isGzip(response.message.headers)
-        )
-      } else if (isRetryableStatusCode(response.message.statusCode)) {
+        try {
+          const isGzipped = isGzip(response.message.headers)
+          await this.pipeResponseToFile(response, destinationStream, isGzipped)
+
+          if (
+            isGzipped ||
+            isAllBytesReceived(
+              response.message.headers['content-length'],
+              await getFileSize(downloadPath)
+            )
+          ) {
+            return
+          } else {
+            forceRetry = true
+          }
+        } catch (error) {
+          // retry on error, most likely streams were corrupted
+          forceRetry = true
+        }
+      }
+
+      if (forceRetry || isRetryableStatusCode(response.message.statusCode)) {
         core.info(
           `A ${response.message.statusCode} response code has been received while attempting to download an artifact`
         )
+        resetDestinationStream(downloadPath)
         // if a throttled status code is received, try to get the retryAfter header value, else differ to standard exponential backoff
         isThrottledStatusCode(response.message.statusCode)
           ? await backOff(
@@ -263,26 +306,48 @@ export class DownloadHttpClient {
       if (isGzip) {
         const gunzip = zlib.createGunzip()
         response.message
+          .on('error', error => {
+            core.error(
+              `An error occurred while attempting to read the response stream`
+            )
+            gunzip.close()
+            destinationStream.close()
+            reject(error)
+          })
           .pipe(gunzip)
+          .on('error', error => {
+            core.error(
+              `An error occurred while attempting to decompress the response stream`
+            )
+            destinationStream.close()
+            reject(error)
+          })
           .pipe(destinationStream)
           .on('close', () => {
             resolve()
           })
           .on('error', error => {
             core.error(
-              `An error has been encountered while decompressing and writing a downloaded file to ${destinationStream.path}`
+              `An error occurred while writing a downloaded file to ${destinationStream.path}`
             )
             reject(error)
           })
       } else {
         response.message
+          .on('error', error => {
+            core.error(
+              `An error occurred while attempting to read the response stream`
+            )
+            destinationStream.close()
+            reject(error)
+          })
           .pipe(destinationStream)
           .on('close', () => {
             resolve()
           })
           .on('error', error => {
             core.error(
-              `An error has been encountered while writing a downloaded file to ${destinationStream.path}`
+              `An error occurred while writing a downloaded file to ${destinationStream.path}`
             )
             reject(error)
           })

@@ -65,15 +65,16 @@ export function isForbiddenStatusCode(statusCode?: number): boolean {
   return statusCode === HttpCodes.Forbidden
 }
 
-export function isRetryableStatusCode(statusCode?: number): boolean {
+export function isRetryableStatusCode(statusCode: number | undefined): boolean {
   if (!statusCode) {
     return false
   }
 
   const retryableStatusCodes = [
     HttpCodes.BadGateway,
-    HttpCodes.ServiceUnavailable,
     HttpCodes.GatewayTimeout,
+    HttpCodes.InternalServerError,
+    HttpCodes.ServiceUnavailable,
     HttpCodes.TooManyRequests,
     413 // Payload Too Large
   ]
@@ -303,6 +304,18 @@ export async function createEmptyFilesForArtifact(
   }
 }
 
+export async function getFileSize(filePath: string): Promise<number> {
+  const stats = await fs.stat(filePath)
+  debug(
+    `${filePath} size:(${stats.size}) blksize:(${stats.blksize}) blocks:(${stats.blocks})`
+  )
+  return stats.size
+}
+
+export async function rmFile(filePath: string): Promise<void> {
+  await fs.unlink(filePath)
+}
+
 export function getProperRetention(
   retentionInput: number,
   retentionSetting: string | undefined
@@ -322,4 +335,8 @@ export function getProperRetention(
     }
   }
   return retention
+}
+
+export async function sleep(milliseconds: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, milliseconds))
 }

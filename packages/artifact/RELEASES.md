@@ -41,3 +41,23 @@
 ### 0.4.0
 
 - Add option to specify custom retentions on artifacts
+
+### 0.4.1
+
+- Update to latest @actions/core version
+
+### 0.4.2
+
+- Improved retry-ability when a partial artifact download is encountered
+
+### 0.5.0
+
+- Improved retry-ability for all http calls during artifact upload and download if an error is encountered
+
+### 0.5.1
+
+- Bump @actions/http-client to version 1.0.11 to fix proxy related issues during artifact upload and download
+
+### 0.5.2
+
+- Add HTTP 500 as a retryable status code for artifact upload and download.
